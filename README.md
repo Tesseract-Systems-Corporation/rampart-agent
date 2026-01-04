@@ -2,6 +2,8 @@
 
 Lightweight daemon that captures security events from your servers for compliance evidence.
 
+**Get started at [ramparthq.com](https://ramparthq.com)** - The agent sends events to the Rampart control plane, where you can view your compliance posture, generate audit reports, and track SOC 2 evidence.
+
 ## What It Does
 
 The agent monitors your server and reports events to the Rampart control plane:
