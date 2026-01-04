@@ -1,0 +1,45 @@
+# Binaries
+cloudling-agent
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/bin/
+/dist/
+
+# Local config (contains secrets)
+config.yaml
+*.local.yaml
+
+# Buffer directory
+/var/lib/rampart/
+
+# Temporary files
+/tmp/
+*.tmp
+*.log

@@ -1,0 +1,66 @@
+# Rampart Agent Configuration
+# Copy this to /etc/rampart/agent.yaml and customize
+
+# API key for authentication with the control plane
+# Get this from your Rampart dashboard
+api_key: "cl_live_your_api_key_here"
+
+# Fortress ID this agent belongs to
+# Get this from your Rampart dashboard
+fortress_id: "fort_your_fortress_id"
+
+# Server ID (auto-generated if empty)
+# server_id: "srv_custom_id"
+
+# Control plane URL
+control_plane: "https://api.ramparthq.com"
+
+# Watcher configurations
+watchers:
+  # Docker container monitoring
+  docker:
+    enabled: true
+    socket: "/var/run/docker.sock"
+
+  # SSH access logging
+  ssh:
+    enabled: true
+    log_path: "/var/log/auth.log"
+
+  # File drift detection
+  drift:
+    enabled: true
+    watch_paths:
+      - /etc/nginx
+      - /etc/ssl
+      - /opt/coolify
+    ignore_patterns:
+      - "*.log"
+      - "*.tmp"
+      - "*.swp"
+      - "*.bak"
+
+  # System health monitoring
+  health:
+    enabled: true
+    interval: "30s"
+
+  # Network port scanning
+  network:
+    enabled: true
+    scan_interval: "5m"
+
+# Event emitter configuration
+emitter:
+  # Events per batch
+  batch_size: 100
+
+  # How often to flush (even if batch not full)
+  flush_interval: "10s"
+
+  # Where to store events when offline
+  buffer_path: "/var/lib/rampart/buffer"
+
+  # Retry settings for failed requests
+  max_retries: 3
+  retry_delay: "1s"
