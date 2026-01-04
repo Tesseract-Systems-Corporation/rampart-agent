@@ -24,24 +24,59 @@ The agent monitors your server and reports events to the Rampart control plane:
 
 ## Installation
 
-### Ubuntu/Debian
+**Native install is recommended.** The agent needs access to system logs, network state, and filesystem to collect compliance evidence. Docker deployment requires privileged mode.
+
+### Ubuntu/Debian (Recommended)
 
 ```bash
 # Download and install
 curl -fsSL https://get.ramparthq.com/agent | sudo bash
 
 # Configure
-sudo nano /etc/rampart-agent/config.yaml
+sudo nano /etc/rampart/agent.yaml
+
+# Start
+sudo systemctl enable --now rampart-agent
 ```
 
-### Manual Installation
+### Build from Source
 
 ```bash
-# Build from source
+# Build
 go build -o rampart-agent ./cmd/agent
 
 # Run
 ./rampart-agent --config /path/to/config.yaml
+```
+
+### Docker
+
+Docker deployment requires privileged mode for full host visibility:
+
+```bash
+docker run -d \
+  --name rampart-agent \
+  --privileged \
+  --net=host \
+  --pid=host \
+  -v /:/host:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v /var/lib/rampart:/var/lib/rampart \
+  -v /path/to/config.yaml:/etc/rampart/agent.yaml:ro \
+  -e HOST_ROOT=/host \
+  rampart-agent:latest
+```
+
+**Why privileged?** The agent needs to read auth logs, scan for vulnerabilities, monitor network connections, and detect drift across the filesystem. Without host access, most watchers won't function.
+
+For Docker-only monitoring (containers only, no host visibility):
+
+```bash
+docker run -d \
+  --name rampart-agent \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -v /path/to/config.yaml:/etc/rampart/agent.yaml:ro \
+  rampart-agent:latest
 ```
 
 ## Configuration

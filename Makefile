@@ -46,9 +46,24 @@ deps:
 docker-build:
 	docker build -t rampart-agent:$(VERSION) .
 
-# Run in Docker
+# Run in Docker (full host access for all watchers)
 docker-run:
 	docker run --rm \
+		--name rampart-agent \
+		--privileged \
+		--net=host \
+		--pid=host \
+		-v /:/host:ro \
+		-v /var/run/docker.sock:/var/run/docker.sock:ro \
+		-v /var/lib/rampart:/var/lib/rampart \
+		-v $(PWD)/config.yaml:/etc/rampart/agent.yaml:ro \
+		-e HOST_ROOT=/host \
+		rampart-agent:$(VERSION)
+
+# Run in Docker (minimal - Docker monitoring only)
+docker-run-minimal:
+	docker run --rm \
+		--name rampart-agent \
 		-v /var/run/docker.sock:/var/run/docker.sock:ro \
 		-v $(PWD)/config.yaml:/etc/rampart/agent.yaml:ro \
 		rampart-agent:$(VERSION)
