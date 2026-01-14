@@ -150,6 +150,15 @@ const (
 	BackupStale     EventType = "backup.stale"
 )
 
+// Event types for PostgreSQL database backup widget
+const (
+	PGDatabaseDetected EventType = "pg_database.detected"
+	PGBackupStarted    EventType = "pg_backup.started"
+	PGBackupProgress   EventType = "pg_backup.progress"
+	PGBackupCompleted  EventType = "pg_backup.completed"
+	PGBackupFailed     EventType = "pg_backup.failed"
+)
+
 // ActorType represents who or what triggered an event.
 type ActorType string
 
