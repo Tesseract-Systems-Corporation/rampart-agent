@@ -187,6 +187,14 @@ func (e *Emitter) Send(ev event.Event) {
 	}
 }
 
+// SendImmediate sends an event immediately without batching.
+// Use this for command responses that need to be delivered right away.
+func (e *Emitter) SendImmediate(ctx context.Context, ev event.Event) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return e.sendBatch(ctx, []event.Event{ev})
+}
+
 // Run starts the emitter. It blocks until the context is cancelled.
 func (e *Emitter) Run(ctx context.Context) error {
 	e.logger.Info("starting emitter",

@@ -7,14 +7,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
+	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/backup"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/config"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/emitter"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/platform"
@@ -23,6 +26,64 @@ import (
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/pkg/event"
 	"golang.org/x/sync/errgroup"
 )
+
+// getPIDFilePath returns the path for the PID lock file.
+// Uses /var/lib/rampart which should be created by the installer.
+// Falls back to /tmp if the directory doesn't exist.
+func getPIDFilePath() string {
+	// Preferred location - /var/lib/rampart (should be created during install)
+	dir := "/var/lib/rampart"
+	if _, err := os.Stat(dir); err == nil {
+		return dir + "/rampart-agent.pid"
+	}
+	// Try to create the directory
+	if err := os.MkdirAll(dir, 0755); err == nil {
+		return dir + "/rampart-agent.pid"
+	}
+	// Fall back to /tmp (always writable, but clears on reboot - that's OK for a lock file)
+	return "/tmp/rampart-agent.pid"
+}
+
+// acquirePIDLock tries to acquire an exclusive lock on the PID file.
+// Returns the file handle (keep open to maintain lock), the path used, or error if another instance is running.
+func acquirePIDLock() (*os.File, string, error) {
+	pidFilePath := getPIDFilePath()
+
+	// Open or create the PID file
+	f, err := os.OpenFile(pidFilePath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to open PID file: %w", err)
+	}
+
+	// Try to acquire exclusive lock (non-blocking)
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		// Lock failed - another instance is running
+		// Try to read the existing PID for a helpful error message
+		existingPID := "unknown"
+		if data, readErr := os.ReadFile(pidFilePath); readErr == nil && len(data) > 0 {
+			existingPID = string(data)
+		}
+		f.Close()
+		return nil, "", fmt.Errorf("another rampart-agent instance is already running (PID: %s)", existingPID)
+	}
+
+	// Write our PID to the file
+	if err := f.Truncate(0); err != nil {
+		f.Close()
+		return nil, "", fmt.Errorf("failed to truncate PID file: %w", err)
+	}
+	if _, err := f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0); err != nil {
+		f.Close()
+		return nil, "", fmt.Errorf("failed to write PID: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return nil, "", fmt.Errorf("failed to sync PID file: %w", err)
+	}
+
+	return f, pidFilePath, nil
+}
 
 var version = "dev" // Set at build time via -ldflags
 
@@ -55,6 +116,15 @@ func main() {
 		Level: level,
 	}))
 	slog.SetDefault(logger)
+
+	// Acquire PID lock to prevent multiple instances
+	pidFile, pidPath, err := acquirePIDLock()
+	if err != nil {
+		logger.Error("failed to acquire PID lock", "error", err)
+		os.Exit(1)
+	}
+	defer pidFile.Close()
+	logger.Info("acquired PID lock", "pid_file", pidPath, "pid", os.Getpid())
 
 	// Load configuration
 	cfg, err := config.LoadFromFile(*configPath)
@@ -152,8 +222,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	// Create an event channel for on-demand scans triggered by control plane
 	onDemandEvents := make(chan event.Event, 100)
 
+	// Create PG backup executor
+	pgExecutor := backup.NewPGExecutor(logger.With("component", "pg-backup"))
+
 	// Shared command handler for both HTTP heartbeat and WebSocket
-	handleCommand := func(cmdType, cmdID string) {
+	handleCommand := func(cmdType, cmdID string, payload json.RawMessage) {
 		switch cmdType {
 		case "trigger_vulnerability_scan":
 			if vulnWatcher != nil {
@@ -167,6 +240,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 			} else {
 				logger.Warn("received malware scan command but watcher not enabled")
 			}
+		case "trigger_pg_backup":
+			go handlePGBackup(ctx, pgExecutor, payload, emit, logger)
+		case "test_pg_connection":
+			go handleTestPGConnection(ctx, pgExecutor, payload, emit, logger, cfg.FortressID, cfg.ServerID)
 		default:
 			logger.Warn("unknown command received", "command", cmdType)
 		}
@@ -174,7 +251,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 
 	// Set up command handler for HTTP heartbeat commands (fallback)
 	emit.SetCommandHandler(func(cmd emitter.Command) {
-		handleCommand(cmd.Command, cmd.ID)
+		handleCommand(cmd.Command, cmd.ID, cmd.Payload)
 	})
 
 	// Create WebSocket client for instant command delivery
@@ -191,7 +268,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 
 	// Set up WebSocket command handler
 	wsClient.SetCommandHandler(func(cmd wsconn.Command) {
-		handleCommand(cmd.Command, cmd.ID)
+		handleCommand(cmd.Command, cmd.ID, cmd.Payload)
 	})
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -600,4 +677,128 @@ func createWatchersWithVuln(cfg *config.Config, logger *slog.Logger) ([]watcher.
 	}
 
 	return watchers, vulnWatcher, malwareWatcher
+}
+
+// handlePGBackup handles the trigger_pg_backup command from the control plane.
+func handlePGBackup(ctx context.Context, executor *backup.PGExecutor, payload json.RawMessage, emit *emitter.Emitter, logger *slog.Logger) {
+	var p struct {
+		JobID        string `json:"job_id"`
+		DatasourceID string `json:"datasource_id"`
+		Host         string `json:"host"`
+		Port         int    `json:"port"`
+		Database     string `json:"database"`
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		SSLMode      string `json:"ssl_mode"`
+		StorageType  string `json:"storage_type"`
+		StoragePath  string `json:"storage_path"`
+		S3Endpoint   string `json:"s3_endpoint"`
+		S3AccessKey  string `json:"s3_access_key"`
+		S3SecretKey  string `json:"s3_secret_key"`
+		S3Region     string `json:"s3_region"`
+	}
+
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Error("failed to parse pg_backup payload", "error", err)
+		return
+	}
+
+	logger.Info("starting pg backup",
+		"job_id", p.JobID,
+		"database", p.Database,
+		"host", p.Host,
+	)
+
+	cfg := backup.BackupConfig{
+		JobID:        p.JobID,
+		DatasourceID: p.DatasourceID,
+		Host:         p.Host,
+		Port:         p.Port,
+		Database:     p.Database,
+		Username:     p.Username,
+		Password:     p.Password,
+		SSLMode:      p.SSLMode,
+		StorageType:  p.StorageType,
+		StoragePath:  p.StoragePath,
+		S3Endpoint:   p.S3Endpoint,
+		S3AccessKey:  p.S3AccessKey,
+		S3SecretKey:  p.S3SecretKey,
+		S3Region:     p.S3Region,
+	}
+
+	// Create a progress channel
+	progressCh := make(chan backup.BackupProgress, 100)
+
+	// Start the backup in a goroutine
+	go executor.Execute(ctx, cfg, progressCh)
+
+	// Forward progress updates as events (send immediately for real-time updates)
+	for progress := range progressCh {
+		ev := event.NewEvent(event.PGBackupProgress, "", "", map[string]any{
+			"job_id":           progress.JobID,
+			"datasource_id":    progress.DatasourceID,
+			"status":           progress.Status,
+			"progress_percent": progress.ProgressPercent,
+			"current_phase":    progress.CurrentPhase,
+			"size_bytes":       progress.SizeBytes,
+			"duration_seconds": progress.DurationSeconds,
+			"backup_path":      progress.BackupPath,
+			"error_message":    progress.ErrorMessage,
+		})
+		if err := emit.SendImmediate(ctx, ev); err != nil {
+			logger.Warn("failed to send backup progress event", "error", err)
+		}
+	}
+}
+
+// handleTestPGConnection handles the test_pg_connection command from the control plane.
+func handleTestPGConnection(ctx context.Context, executor *backup.PGExecutor, payload json.RawMessage, emit *emitter.Emitter, logger *slog.Logger, fortressID, serverID string) {
+	var p struct {
+		CommandID    string `json:"command_id"`
+		DatasourceID string `json:"datasource_id"`
+		Host         string `json:"host"`
+		Port         int    `json:"port"`
+		Database     string `json:"database"`
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		SSLMode      string `json:"ssl_mode"`
+	}
+
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Error("failed to parse test_pg_connection payload", "error", err)
+		return
+	}
+
+	logger.Info("testing pg connection",
+		"datasource_id", p.DatasourceID,
+		"host", p.Host,
+		"database", p.Database,
+	)
+
+	cfg := backup.BackupConfig{
+		DatasourceID: p.DatasourceID,
+		Host:         p.Host,
+		Port:         p.Port,
+		Database:     p.Database,
+		Username:     p.Username,
+		Password:     p.Password,
+		SSLMode:      p.SSLMode,
+	}
+
+	success, err := executor.TestConnection(ctx, cfg)
+
+	result := map[string]any{
+		"command_id":    p.CommandID,
+		"datasource_id": p.DatasourceID,
+		"success":       success,
+	}
+	if err != nil {
+		result["error"] = err.Error()
+	}
+
+	ev := event.NewEvent(event.PGConnectionTestResult, fortressID, serverID, result)
+	// Send immediately - command responses need instant delivery
+	if err := emit.SendImmediate(ctx, ev); err != nil {
+		logger.Error("failed to send test result", "error", err)
+	}
 }

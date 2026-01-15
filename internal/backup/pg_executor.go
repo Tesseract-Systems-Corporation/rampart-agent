@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	_ "github.com/lib/pq" // PostgreSQL driver
 )
 
@@ -31,6 +33,11 @@ type BackupConfig struct {
 	SSLMode      string
 	StorageType  string // "local" or "s3"
 	StoragePath  string
+	// S3/Object Storage credentials (only used when StorageType is "s3")
+	S3Endpoint  string
+	S3AccessKey string
+	S3SecretKey string
+	S3Region    string
 }
 
 // BackupProgress represents the progress of a backup job.
@@ -60,6 +67,9 @@ func NewPGExecutor(logger *slog.Logger) *PGExecutor {
 
 // Execute runs a PostgreSQL backup and reports progress.
 func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh chan<- BackupProgress) {
+	// Close the progress channel when we're done so the caller's range loop can exit
+	defer close(progressCh)
+
 	startTime := time.Now()
 
 	// Helper to send progress
@@ -105,17 +115,18 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 	// Set connection timeout
 	db.SetConnMaxIdleTime(5 * time.Second)
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	// Use a short timeout only for the connection test, not for the entire backup
+	connCtx, connCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer connCancel()
 
-	if err := db.PingContext(ctx); err != nil {
+	if err := db.PingContext(connCtx); err != nil {
 		sendProgress("failed", 5, "connecting", fmt.Errorf("failed to connect: %w", err))
 		return
 	}
 
 	// Get database size for progress estimation
 	var dbSize int64
-	err = db.QueryRowContext(ctx, "SELECT pg_database_size($1)", cfg.Database).Scan(&dbSize)
+	err = db.QueryRowContext(connCtx, "SELECT pg_database_size($1)", cfg.Database).Scan(&dbSize)
 	if err != nil {
 		e.logger.Warn("could not get database size", "error", err)
 		dbSize = 0
@@ -124,9 +135,15 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 	sendProgress("running", 10, "dumping", nil)
 
 	// Phase 2: Create backup directory
-	backupDir := cfg.StoragePath
-	if backupDir == "" {
-		backupDir = "/var/lib/rampart/backups"
+	// For S3 uploads, use a temp directory; for local storage, use StoragePath
+	var backupDir string
+	if cfg.StorageType == "s3" {
+		backupDir = "/tmp/rampart-backups"
+	} else {
+		backupDir = cfg.StoragePath
+		if backupDir == "" {
+			backupDir = "/var/lib/rampart/backups"
+		}
 	}
 
 	if err := os.MkdirAll(backupDir, 0755); err != nil {
@@ -258,10 +275,9 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 	gzWriter.Close()
 	outFile.Close()
 
-	// Phase 4: Finalize
-	sendProgress("running", 90, "finalizing", nil)
+	// Phase 4: Get file size
+	sendProgress("running", 85, "finalizing", nil)
 
-	// Get final file size
 	fileInfo, err := os.Stat(backupFile)
 	if err != nil {
 		e.logger.Warn("could not stat backup file", "error", err)
@@ -272,7 +288,30 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 		finalSize = fileInfo.Size()
 	}
 
-	// Phase 5: Complete
+	// Phase 5: Upload to S3 if configured
+	finalPath := backupFile
+	if cfg.StorageType == "s3" && cfg.S3AccessKey != "" {
+		sendProgress("running", 90, "uploading", nil)
+
+		s3Path, err := e.uploadToS3(ctx, cfg, backupFile)
+		if err != nil {
+			sendProgress("failed", 90, "uploading", fmt.Errorf("S3 upload failed: %w", err))
+			return
+		}
+
+		finalPath = s3Path
+		e.logger.Info("backup uploaded to S3",
+			"job_id", cfg.JobID,
+			"s3_path", s3Path,
+		)
+
+		// Optionally remove local file after S3 upload
+		if err := os.Remove(backupFile); err != nil {
+			e.logger.Warn("failed to remove local backup file after S3 upload", "error", err)
+		}
+	}
+
+	// Phase 6: Complete
 	duration := time.Since(startTime)
 	progress := BackupProgress{
 		JobID:           cfg.JobID,
@@ -282,7 +321,7 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 		CurrentPhase:    "completed",
 		SizeBytes:       finalSize,
 		DurationSeconds: int64(duration.Seconds()),
-		BackupPath:      backupFile,
+		BackupPath:      finalPath,
 	}
 	progressCh <- progress
 
@@ -291,17 +330,21 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 		"database", cfg.Database,
 		"size_bytes", finalSize,
 		"duration", duration,
-		"path", backupFile,
+		"path", finalPath,
 	)
 }
 
 // TestConnection tests a PostgreSQL connection.
 func (e *PGExecutor) TestConnection(ctx context.Context, cfg BackupConfig) (bool, error) {
-	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+	e.logger.Info("TestConnection starting", "host", cfg.Host, "port", cfg.Port)
+
+	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s connect_timeout=5",
 		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, cfg.SSLMode)
 
+	e.logger.Info("opening db connection")
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
+		e.logger.Error("sql.Open failed", "error", err)
 		return false, fmt.Errorf("failed to create connection: %w", err)
 	}
 	defer db.Close()
@@ -311,9 +354,12 @@ func (e *PGExecutor) TestConnection(ctx context.Context, cfg BackupConfig) (bool
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
+	e.logger.Info("calling PingContext")
 	if err := db.PingContext(ctx); err != nil {
+		e.logger.Error("PingContext failed", "error", err)
 		return false, fmt.Errorf("connection test failed: %w", err)
 	}
+	e.logger.Info("PingContext succeeded")
 
 	// Try a simple query
 	var version string
@@ -328,4 +374,76 @@ func (e *PGExecutor) TestConnection(ctx context.Context, cfg BackupConfig) (bool
 	)
 
 	return true, nil
+}
+
+// uploadToS3 uploads a backup file to S3/Object Storage using minio-go.
+func (e *PGExecutor) uploadToS3(ctx context.Context, cfg BackupConfig, localPath string) (string, error) {
+	// Parse bucket and key from storage path
+	// Expected format: bucket-name/path/to/backups or just bucket-name
+	parts := strings.SplitN(cfg.StoragePath, "/", 2)
+	bucket := parts[0]
+	keyPrefix := ""
+	if len(parts) > 1 {
+		keyPrefix = parts[1]
+	}
+
+	// Build the S3 key (object path)
+	filename := filepath.Base(localPath)
+	var key string
+	if keyPrefix != "" {
+		key = keyPrefix + "/" + filename
+	} else {
+		key = filename
+	}
+
+	e.logger.Info("uploading to S3",
+		"endpoint", cfg.S3Endpoint,
+		"bucket", bucket,
+		"key", key,
+	)
+
+	// Parse the endpoint URL to get host
+	endpoint := cfg.S3Endpoint
+	useSSL := true
+	if strings.HasPrefix(endpoint, "https://") {
+		endpoint = strings.TrimPrefix(endpoint, "https://")
+	} else if strings.HasPrefix(endpoint, "http://") {
+		endpoint = strings.TrimPrefix(endpoint, "http://")
+		useSSL = false
+	}
+
+	// Create minio client
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(cfg.S3AccessKey, cfg.S3SecretKey, ""),
+		Secure: useSSL,
+		Region: cfg.S3Region,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create S3 client: %w", err)
+	}
+
+	// Open the file
+	file, err := os.Open(localPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open backup file: %w", err)
+	}
+	defer file.Close()
+
+	// Get file info for content length
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("failed to stat backup file: %w", err)
+	}
+
+	// Upload the file
+	_, err = client.PutObject(ctx, bucket, key, file, fileInfo.Size(), minio.PutObjectOptions{
+		ContentType: "application/gzip",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload to S3: %w", err)
+	}
+
+	// Return the S3 path
+	s3Path := fmt.Sprintf("s3://%s/%s", bucket, key)
+	return s3Path, nil
 }
