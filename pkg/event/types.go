@@ -160,6 +160,11 @@ const (
 	PGConnectionTestResult EventType = "pg_connection.test_result"
 )
 
+// Agent self-update events
+const (
+	AgentUpdateResult EventType = "agent.update_result"
+)
+
 // ActorType represents who or what triggered an event.
 type ActorType string
 

@@ -23,6 +23,7 @@ import (
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/plugin"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/plugin/pgbackup"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/plugin/s3storage"
+	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/updater"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/watcher"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/wsconn"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/pkg/event"
@@ -227,6 +228,9 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	// Create plugin registry
 	registry := plugin.NewRegistry(logger)
 
+	// Create updater for self-update functionality
+	agentUpdater := updater.New(logger, version)
+
 	// Register plugins
 	pgPlugin := pgbackup.New(logger, cfg.FortressID, cfg.ServerID)
 	if err := registry.Register(pgPlugin); err != nil {
@@ -268,6 +272,8 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 			} else {
 				logger.Warn("received malware scan command but watcher not enabled")
 			}
+		case "update_agent":
+			go handleUpdateAgent(ctx, agentUpdater, payload, emit, logger, cfg.FortressID, cfg.ServerID)
 		default:
 			logger.Warn("unknown command received", "command", cmdType)
 		}
@@ -723,4 +729,48 @@ func createWatchersWithVuln(cfg *config.Config, logger *slog.Logger) ([]watcher.
 	}
 
 	return watchers, vulnWatcher, malwareWatcher
+}
+
+// handleUpdateAgent handles the update_agent command from the control plane.
+func handleUpdateAgent(ctx context.Context, u *updater.Updater, payload json.RawMessage, emit *emitter.Emitter, logger *slog.Logger, fortressID, serverID string) {
+	var p struct {
+		CommandID string `json:"command_id"`
+		Version   string `json:"version"` // Target version, or "latest"
+	}
+
+	if err := json.Unmarshal(payload, &p); err != nil {
+		logger.Error("failed to parse update_agent payload", "error", err)
+		return
+	}
+
+	logger.Info("received update command", "target_version", p.Version)
+
+	// Perform update
+	result := u.Update(ctx, p.Version)
+
+	// Send result event
+	ev := event.NewEvent(event.AgentUpdateResult, fortressID, serverID, map[string]any{
+		"command_id":       p.CommandID,
+		"success":          result.Success,
+		"previous_version": result.PreviousVersion,
+		"new_version":      result.NewVersion,
+		"error":            result.Error,
+		"restart_required": result.RestartRequired,
+	})
+
+	if err := emit.SendImmediate(ctx, ev); err != nil {
+		logger.Error("failed to send update result", "error", err)
+	}
+
+	// If update was successful and restart is required, exit so systemd restarts us
+	if result.Success && result.RestartRequired {
+		logger.Info("update successful, exiting for restart")
+		// Give a moment for the event to be sent
+		select {
+		case <-ctx.Done():
+		case <-make(chan struct{}):
+			// Small delay would go here, but we don't want to block
+		}
+		os.Exit(0)
+	}
 }
