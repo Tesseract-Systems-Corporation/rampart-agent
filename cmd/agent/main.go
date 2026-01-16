@@ -12,10 +12,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/config"
 	"github.com/Tesseract-Systems-Corporation/rampart-agent/internal/emitter"
@@ -358,6 +360,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	// Start WebSocket client for instant command delivery
 	g.Go(func() error {
 		return wsClient.Run(ctx)
+	})
+
+	// Start auto-update checker (every 24 hours)
+	g.Go(func() error {
+		return runAutoUpdateChecker(ctx, agentUpdater, emit, logger, cfg.FortressID, cfg.ServerID)
 	})
 
 	// Wait for all goroutines
@@ -773,4 +780,108 @@ func handleUpdateAgent(ctx context.Context, u *updater.Updater, payload json.Raw
 		}
 		os.Exit(0)
 	}
+}
+
+// runAutoUpdateChecker periodically checks for new agent versions and auto-updates.
+// Checks every 24 hours with a random jitter to avoid thundering herd.
+func runAutoUpdateChecker(ctx context.Context, u *updater.Updater, emit *emitter.Emitter, logger *slog.Logger, fortressID, serverID string) error {
+	logger = logger.With("component", "auto-updater")
+
+	// Initial delay: 5-15 minutes after startup (random jitter)
+	// This avoids checking immediately on every restart and spreads load
+	initialDelay := 5*time.Minute + time.Duration(rand.Int63n(int64(10*time.Minute)))
+	logger.Info("auto-update checker starting", "initial_delay", initialDelay.Round(time.Second))
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-time.After(initialDelay):
+	}
+
+	// Check interval: 24 hours with up to 1 hour jitter
+	checkInterval := 24 * time.Hour
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	// Run immediately after initial delay, then on ticker
+	for {
+		if err := checkAndUpdate(ctx, u, emit, logger, fortressID, serverID); err != nil {
+			logger.Warn("auto-update check failed", "error", err)
+		}
+
+		// Add jitter to next check (0-60 minutes)
+		jitter := time.Duration(rand.Int63n(int64(60 * time.Minute)))
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			// Add jitter by sleeping a bit more
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(jitter):
+			}
+		}
+	}
+}
+
+// checkAndUpdate checks for a new version and updates if available.
+func checkAndUpdate(ctx context.Context, u *updater.Updater, emit *emitter.Emitter, logger *slog.Logger, fortressID, serverID string) error {
+	logger.Debug("checking for updates")
+
+	// Get latest version
+	latest, err := u.GetLatestVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("get latest version: %w", err)
+	}
+
+	logger.Debug("latest version available", "latest", latest, "current", event.Version)
+
+	// Normalize current version for comparison
+	currentVersion := event.Version
+	if currentVersion != "" && currentVersion[0] != 'v' {
+		currentVersion = "v" + currentVersion
+	}
+
+	// Check if we're already on the latest
+	if latest == currentVersion {
+		logger.Debug("already on latest version")
+		return nil
+	}
+
+	logger.Info("new version available, updating", "from", currentVersion, "to", latest)
+
+	// Perform update
+	result := u.Update(ctx, latest)
+
+	// Send result event
+	ev := event.NewEvent(event.AgentUpdateResult, fortressID, serverID, map[string]any{
+		"command_id":       "auto-update",
+		"success":          result.Success,
+		"previous_version": result.PreviousVersion,
+		"new_version":      result.NewVersion,
+		"error":            result.Error,
+		"restart_required": result.RestartRequired,
+		"auto_update":      true,
+	})
+
+	if err := emit.SendImmediate(ctx, ev); err != nil {
+		logger.Error("failed to send update result", "error", err)
+	}
+
+	// If update was successful and restart is required, exit so systemd restarts us
+	if result.Success && result.RestartRequired {
+		logger.Info("auto-update successful, exiting for restart")
+		// Brief delay to allow event to be sent
+		time.Sleep(2 * time.Second)
+		os.Exit(0)
+	}
+
+	if !result.Success {
+		return fmt.Errorf("update failed: %s", result.Error)
+	}
+
+	return nil
 }
