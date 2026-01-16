@@ -142,6 +142,21 @@ go test ./...
   --fortress-id fort_xxxxxxxxxxxx
 ```
 
+## Plugins
+
+The agent supports plugins for on-demand operations triggered by the control plane.
+
+### PostgreSQL Backup
+
+Backup PostgreSQL databases to local disk or S3-compatible storage:
+
+- **Single database** - Backup a specific database
+- **All databases** - Backup all databases on a server with one configuration
+- **S3 upload** - Upload backups to AWS S3, MinIO, OCI Object Storage, etc.
+- **Real-time progress** - Track backup progress in the control plane UI
+
+See [internal/plugin/README.md](internal/plugin/README.md) for plugin development.
+
 ## Architecture
 
 ```
@@ -149,6 +164,8 @@ rampart-agent/
 ├── cmd/agent/          # Entry point
 ├── internal/
 │   ├── watcher/        # Event watchers (docker, ssh, drift, etc.)
+│   ├── plugin/         # Plugin system (pg_backup, s3_storage, etc.)
+│   ├── backup/         # PostgreSQL backup executor
 │   ├── emitter/        # Batches and sends events to control plane
 │   ├── config/         # Configuration loading
 │   ├── checkpoint/     # Checkpoint workflow

@@ -47,7 +47,7 @@ type Plugin interface {
 
 ### Optional: Passive Monitoring
 
-Plugins that need to emit events periodically (not just in response to commands) should implement `WatcherPlugin`:
+Plugins that need to emit events periodically (not just in response to commands) can implement `WatcherPlugin`:
 
 ```go
 type WatcherPlugin interface {
@@ -55,6 +55,8 @@ type WatcherPlugin interface {
     Watch(ctx context.Context) (<-chan event.Event, error)
 }
 ```
+
+> **Note:** No plugins currently implement `WatcherPlugin`. Passive monitoring is handled by the watchers in `internal/watcher/` (docker, ssh, drift, etc.), which predate the plugin system.
 
 ## Creating a New Plugin
 
@@ -165,12 +167,28 @@ Use namespaced event types:
 PostgreSQL backup plugin supporting local and S3 storage.
 
 **Commands:**
-- `trigger_pg_backup` - Start a backup job
+- `trigger_pg_backup` - Start a backup job (single database or all databases)
 - `test_pg_connection` - Test database connectivity
 
 **Events:**
-- `pg_backup.progress` - Real-time backup progress
+- `pg_backup.progress` - Real-time backup progress (includes multi-database status)
 - `pg_connection.test_result` - Connection test result
+
+**Features:**
+- Single database or all-databases mode
+- Gzip compression
+- S3/object storage upload
+- Partial success (continues if some databases fail)
+
+### s3_storage
+
+S3-compatible storage configuration plugin. Provides storage location management for backup destinations.
+
+**Commands:**
+- `test_s3_connection` - Test S3 bucket connectivity and permissions
+
+**Events:**
+- `s3_connection.test_result` - Connection test result with detailed permission checks
 
 ## Testing Plugins
 
