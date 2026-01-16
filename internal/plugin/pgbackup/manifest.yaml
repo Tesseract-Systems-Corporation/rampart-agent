@@ -1,0 +1,319 @@
+apiVersion: rampart.io/v1
+kind: Plugin
+metadata:
+  name: pg_backup
+  version: 1.0.0
+  displayName: PostgreSQL Backup
+  description: Backup PostgreSQL databases to local disk or S3-compatible storage
+  category: backup
+  icon: database
+  author: Rampart
+  signed: true
+
+spec:
+  requiresAgent: true
+
+  configSchema:
+    type: object
+    properties:
+      name:
+        type: string
+        title: Name
+        description: A friendly name for this datasource
+        minLength: 1
+        x-order: 1
+      host:
+        type: string
+        title: Host
+        description: PostgreSQL server hostname or IP address
+        x-order: 2
+      port:
+        type: integer
+        title: Port
+        description: PostgreSQL server port
+        default: 5432
+        minimum: 1
+        maximum: 65535
+        x-order: 3
+      backup_all_databases:
+        type: boolean
+        title: Backup all databases
+        description: Backup all databases on this server instead of a single database
+        default: false
+        x-order: 4
+      database_name:
+        type: string
+        title: Database Name
+        description: Name of the database to backup (leave empty when backing up all databases)
+        x-order: 5
+      username:
+        type: string
+        title: Username
+        description: PostgreSQL username
+        x-order: 6
+      password:
+        type: string
+        title: Password
+        description: PostgreSQL password
+        format: password
+        x-secret: true
+        x-order: 7
+      server_id:
+        type: string
+        title: Backup Executor
+        description: The server/agent that will execute pg_dump commands
+        x-lookup: servers
+        x-order: 8
+      ssl_mode:
+        type: string
+        title: SSL Mode
+        description: SSL connection mode
+        enum:
+          - disable
+          - require
+          - prefer
+          - verify-ca
+          - verify-full
+        default: prefer
+        x-order: 9
+      default_storage_location_id:
+        type: string
+        title: Default Backup Target
+        description: Where backups will be stored by default
+        x-lookup: storage_locations
+        x-order: 10
+    required:
+      - name
+      - server_id
+      - host
+      - port
+      - username
+      - password
+
+  # Lookup definitions for x-lookup fields
+  # The UI will automatically fetch data from these endpoints
+  lookups:
+    servers:
+      endpoint: /api/fortresses/{fortressId}/servers
+      labelField: hostname
+      labelFallback: id
+      labelSuffix: status
+      valueField: id
+    storage_locations:
+      endpoint: /api/fortresses/{fortressId}/pg-storage
+      labelField: name
+      labelSuffix: bucket_name
+      valueField: id
+      emptyOption:
+        value: ""
+        label: Local Disk (default)
+
+  form:
+    createEndpoint: /api/fortresses/{fortressId}/pg-datasources
+    updateEndpoint: /api/fortresses/{fortressId}/pg-datasources/{id}
+    testEndpoint: /api/fortresses/{fortressId}/pg-test-connection
+    createTitle: Add Datasource
+    editTitle: Edit Datasource
+    createSubmitLabel: Add Datasource
+    editSubmitLabel: Save Changes
+
+  listView:
+    columns:
+      - field: name
+        title: Name
+        type: text
+        primary: true
+      - field: host
+        title: Host
+        type: template
+        format: "{host}:{port}"
+      - field: database_name
+        title: Database
+        type: text
+      - field: connection_status
+        title: Status
+        type: badge
+        badgeMap:
+          success:
+            variant: success
+            label: Connected
+          failed:
+            variant: danger
+            label: Failed
+          unknown:
+            variant: warning
+            label: Unknown
+      - field: source_type
+        title: Source
+        type: badge
+        badgeMap:
+          detected:
+            variant: info
+            label: Auto-detected
+          manual:
+            variant: default
+            label: Manual
+    emptyState:
+      icon: database
+      title: No Datasources Configured
+      description: Add a PostgreSQL database to start backing up your data.
+
+  views:
+    - id: datasources
+      label: Datasources
+      endpoint: /api/fortresses/{fortressId}/pg-datasources
+      commands:
+        - trigger_pg_backup
+        - test_pg_connection
+        - schedule_pg_backup
+        - edit_pg_datasource
+        - delete_pg_datasource
+    - id: schedules
+      label: Schedules
+      endpoint: /api/fortresses/{fortressId}/pg-schedules
+      listView:
+        columns:
+          - field: datasource_name
+            title: Datasource
+            type: text
+            primary: true
+          - field: frequency
+            title: Schedule
+            type: text
+          - field: storage_type
+            title: Storage
+            type: badge
+            badgeMap:
+              s3:
+                variant: info
+                label: S3
+              local:
+                variant: default
+                label: Local
+          - field: retention_days
+            title: Retention
+            type: template
+            format: "{retention_days} days"
+          - field: next_run_at
+            title: Next Run
+            type: date
+            dateFormat: relative
+          - field: enabled
+            title: Status
+            type: badge
+            badgeMap:
+              "true":
+                variant: success
+                label: Active
+              "false":
+                variant: default
+                label: Paused
+        emptyState:
+          icon: clock
+          title: No Schedules Configured
+          description: Add a schedule to automatically backup your databases.
+      commands:
+        - delete_pg_schedule
+    - id: history
+      label: History
+      endpoint: /api/fortresses/{fortressId}/pg-backups
+      listView:
+        columns:
+          - field: datasource_name
+            title: Datasource
+            type: text
+            primary: true
+          - field: started_at
+            title: Started
+            type: date
+            dateFormat: relative
+          - field: triggered_by
+            title: Trigger
+            type: badge
+            badgeMap:
+              schedule:
+                variant: info
+                label: Scheduled
+              manual:
+                variant: default
+                label: Manual
+          - field: status
+            title: Status
+            type: badge
+            badgeMap:
+              completed:
+                variant: success
+                label: Completed
+              running:
+                variant: info
+                label: Running
+              pending:
+                variant: warning
+                label: Pending
+              failed:
+                variant: danger
+                label: Failed
+              cancelled:
+                variant: default
+                label: Cancelled
+          - field: progress
+            title: Progress
+            type: progress
+          - field: backup_size_bytes
+            title: Size
+            type: bytes
+          - field: duration_seconds
+            title: Duration
+            type: duration
+        emptyState:
+          icon: clipboard
+          title: No Backup History
+          description: Backups will appear here once they complete.
+      commands: []
+
+  commands:
+    - name: trigger_pg_backup
+      displayName: Backup Now
+      description: Execute a backup of this PostgreSQL database
+      icon: play
+      variant: ghost
+    - name: test_pg_connection
+      displayName: Test
+      description: Verify connectivity to the PostgreSQL database
+      icon: check-circle
+      variant: ghost
+    - name: schedule_pg_backup
+      displayName: Schedule
+      description: Create a backup schedule for this datasource
+      icon: clock
+      variant: ghost
+    - name: edit_pg_datasource
+      displayName: Edit
+      description: Edit datasource configuration
+      icon: edit
+      variant: ghost
+    - name: delete_pg_datasource
+      displayName: Delete
+      description: Delete this datasource
+      icon: trash
+      variant: danger
+      confirmMessage: "Delete datasource \"{name}\"? This will also delete all schedules and backup history."
+    - name: delete_pg_schedule
+      displayName: Delete
+      description: Delete this backup schedule
+      icon: trash
+      variant: danger
+      confirmMessage: "Delete this backup schedule?"
+
+  events:
+    - name: pg_backup.progress
+      description: Real-time backup progress updates
+    - name: pg_backup.completed
+      description: Backup completed successfully
+    - name: pg_backup.failed
+      description: Backup failed with error
+    - name: pg_connection.test_result
+      description: Connection test result
+
+# Note: This plugin uses compiled Go code, not declarative steps.
+# The declarative section is omitted because the pg_executor.go handles execution.

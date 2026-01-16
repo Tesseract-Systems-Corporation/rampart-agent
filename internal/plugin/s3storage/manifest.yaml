@@ -1,0 +1,149 @@
+apiVersion: rampart.io/v1
+kind: Plugin
+metadata:
+  name: s3_storage
+  version: 1.0.0
+  displayName: S3 Storage
+  description: S3-compatible storage for backups and file storage
+  category: storage
+  icon: cloud
+  author: Rampart
+  signed: true
+
+spec:
+  requiresAgent: false  # Storage config doesn't require agent - it's just API credentials
+
+  configSchema:
+    type: object
+    properties:
+      name:
+        type: string
+        title: Name
+        description: A friendly name for this storage location
+        minLength: 1
+        x-order: 1
+      endpoint_url:
+        type: string
+        title: S3 Endpoint URL
+        description: "S3-compatible endpoint (e.g., https://s3.amazonaws.com or https://namespace.compat.objectstorage.region.oraclecloud.com)"
+        x-placeholder: "https://s3.us-east-1.amazonaws.com"
+        x-order: 2
+      bucket_name:
+        type: string
+        title: Bucket Name
+        description: Name of the S3 bucket
+        x-order: 3
+      bucket_path:
+        type: string
+        title: Bucket Path
+        description: Optional path prefix within the bucket (e.g., backups/postgres)
+        x-order: 4
+      region:
+        type: string
+        title: Region
+        description: AWS region or equivalent (e.g., us-east-1, us-ashburn-1)
+        x-order: 5
+      access_key:
+        type: string
+        title: Access Key
+        description: S3 access key ID
+        x-order: 6
+      secret_key:
+        type: string
+        title: Secret Key
+        description: S3 secret access key
+        format: password
+        x-secret: true
+        x-order: 7
+    required:
+      - name
+      - endpoint_url
+      - bucket_name
+      - access_key
+      - secret_key
+
+  form:
+    createEndpoint: /api/fortresses/{fortressId}/pg-storage
+    updateEndpoint: /api/fortresses/{fortressId}/pg-storage/{id}
+    testEndpoint: /api/fortresses/{fortressId}/pg-storage/test
+    createTitle: Add Storage Location
+    editTitle: Edit Storage Location
+    createSubmitLabel: Add Storage
+    editSubmitLabel: Save Changes
+
+  listView:
+    columns:
+      - field: name
+        title: Name
+        type: text
+        primary: true
+      - field: storage_type
+        title: Type
+        type: badge
+        badgeMap:
+          s3:
+            variant: info
+            label: S3
+      - field: endpoint_url
+        title: Endpoint
+        type: text
+        className: max-w-[200px] truncate
+      - field: bucket_name
+        title: Bucket
+        type: template
+        format: "{bucket_name}{bucket_path}"
+      - field: test_status
+        title: Status
+        type: badge
+        badgeMap:
+          success:
+            variant: success
+            label: Verified
+          partial:
+            variant: warning
+            label: Partial
+          failed:
+            variant: danger
+            label: Failed
+          untested:
+            variant: default
+            label: Untested
+    emptyState:
+      icon: cloud
+      title: No Storage Locations
+      description: Add an S3-compatible storage location for off-site backups. Local storage is always available.
+
+  views:
+    - id: storage
+      label: Storage
+      endpoint: /api/fortresses/{fortressId}/pg-storage
+      commands:
+        - test_s3_connection
+        - edit_s3_storage
+        - delete_s3_storage
+
+  commands:
+    - name: test_s3_connection
+      displayName: Test
+      description: Verify connectivity to the S3 bucket
+      icon: check-circle
+      variant: ghost
+    - name: edit_s3_storage
+      displayName: Edit
+      description: Edit storage location configuration
+      icon: edit
+      variant: ghost
+    - name: delete_s3_storage
+      displayName: Delete
+      description: Delete this storage location
+      icon: trash
+      variant: danger
+      confirmMessage: "Delete storage location \"{name}\"? Schedules using this location will fall back to local storage."
+
+  events:
+    - name: s3_storage.test_result
+      description: Connection test result
+    - name: s3_storage.upload_completed
+      description: File upload completed
+    - name: s3_storage.upload_failed
+      description: File upload failed

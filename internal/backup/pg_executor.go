@@ -23,16 +23,17 @@ import (
 
 // BackupConfig contains configuration for a backup job.
 type BackupConfig struct {
-	JobID        string
-	DatasourceID string
-	Host         string
-	Port         int
-	Database     string
-	Username     string
-	Password     string
-	SSLMode      string
-	StorageType  string // "local" or "s3"
-	StoragePath  string
+	JobID              string
+	DatasourceID       string
+	Host               string
+	Port               int
+	Database           string
+	Username           string
+	Password           string
+	SSLMode            string
+	BackupAllDatabases bool // If true, backup all databases on the server
+	StorageType        string // "local" or "s3"
+	StoragePath        string
 	// S3/Object Storage credentials (only used when StorageType is "s3")
 	S3Endpoint  string
 	S3AccessKey string
@@ -42,15 +43,20 @@ type BackupConfig struct {
 
 // BackupProgress represents the progress of a backup job.
 type BackupProgress struct {
-	JobID           string `json:"job_id"`
-	DatasourceID    string `json:"datasource_id"`
-	Status          string `json:"status"`
-	ProgressPercent int    `json:"progress_percent"`
-	CurrentPhase    string `json:"current_phase"`
-	SizeBytes       int64  `json:"size_bytes,omitempty"`
-	DurationSeconds int64  `json:"duration_seconds,omitempty"`
-	BackupPath      string `json:"backup_path,omitempty"`
-	ErrorMessage    string `json:"error_message,omitempty"`
+	JobID           string   `json:"job_id"`
+	DatasourceID    string   `json:"datasource_id"`
+	Status          string   `json:"status"`
+	ProgressPercent int      `json:"progress_percent"`
+	CurrentPhase    string   `json:"current_phase"`
+	SizeBytes       int64    `json:"size_bytes,omitempty"`
+	DurationSeconds int64    `json:"duration_seconds,omitempty"`
+	BackupPath      string   `json:"backup_path,omitempty"`
+	BackupPaths     []string `json:"backup_paths,omitempty"`      // Multiple paths when backing up all databases
+	CurrentDatabase string   `json:"current_database,omitempty"`  // Current database being backed up
+	DatabasesTotal  int      `json:"databases_total,omitempty"`   // Total number of databases
+	DatabasesDone   int      `json:"databases_done,omitempty"`    // Number of databases completed
+	FailedDatabases []string `json:"failed_databases,omitempty"`  // Databases that failed to backup
+	ErrorMessage    string   `json:"error_message,omitempty"`
 }
 
 // PGExecutor executes PostgreSQL backup jobs.
@@ -96,7 +102,14 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 		"job_id", cfg.JobID,
 		"database", cfg.Database,
 		"host", cfg.Host,
+		"backup_all_databases", cfg.BackupAllDatabases,
 	)
+
+	// If backing up all databases, use the multi-database execution path
+	if cfg.BackupAllDatabases {
+		e.executeAllDatabases(ctx, cfg, progressCh, startTime)
+		return
+	}
 
 	// Phase 1: Connecting
 	sendProgress("running", 5, "connecting", nil)
@@ -210,7 +223,9 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 	defer progressTicker.Stop()
 
 	// Copy stdout to gzip file and track progress
+	stdoutDone := make(chan struct{})
 	go func() {
+		defer close(stdoutDone)
 		buf := make([]byte, 32*1024) // 32KB buffer
 		for {
 			n, err := stdout.Read(buf)
@@ -247,10 +262,14 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 		select {
 		case <-ctx.Done():
 			cmd.Process.Kill()
+			// Wait for stdout goroutine before cleanup
+			<-stdoutDone
 			sendProgress("failed", 50, "dumping", ctx.Err())
 			return
 		case err := <-done:
 			if err != nil {
+				// Wait for stdout goroutine before cleanup
+				<-stdoutDone
 				sendProgress("failed", 50, "dumping", fmt.Errorf("pg_dump failed: %w", err))
 				os.Remove(backupFile)
 				return
@@ -270,6 +289,9 @@ func (e *PGExecutor) Execute(ctx context.Context, cfg BackupConfig, progressCh c
 			sendProgress("running", percent, "dumping", nil)
 		}
 	}
+
+	// Wait for stdout goroutine to finish reading all data before closing gzWriter
+	<-stdoutDone
 
 	// Close gzip writer to flush
 	gzWriter.Close()
@@ -446,4 +468,292 @@ func (e *PGExecutor) uploadToS3(ctx context.Context, cfg BackupConfig, localPath
 	// Return the S3 path
 	s3Path := fmt.Sprintf("s3://%s/%s", bucket, key)
 	return s3Path, nil
+}
+
+// listDatabases queries PostgreSQL for all non-template databases.
+func (e *PGExecutor) listDatabases(ctx context.Context, connStr string) ([]string, error) {
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open connection: %w", err)
+	}
+	defer db.Close()
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT datname FROM pg_database
+		WHERE datistemplate = false
+		ORDER BY datname
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query databases: %w", err)
+	}
+	defer rows.Close()
+
+	var databases []string
+	for rows.Next() {
+		var dbName string
+		if err := rows.Scan(&dbName); err != nil {
+			continue
+		}
+		databases = append(databases, dbName)
+	}
+
+	return databases, nil
+}
+
+// executeAllDatabases backs up all databases on the server.
+func (e *PGExecutor) executeAllDatabases(ctx context.Context, cfg BackupConfig, progressCh chan<- BackupProgress, startTime time.Time) {
+	// Helper to send progress
+	sendProgress := func(status string, percent int, phase string, currentDB string, dbsTotal, dbsDone int, failedDBs []string, paths []string, totalSize int64, err error) {
+		progress := BackupProgress{
+			JobID:           cfg.JobID,
+			DatasourceID:    cfg.DatasourceID,
+			Status:          status,
+			ProgressPercent: percent,
+			CurrentPhase:    phase,
+			CurrentDatabase: currentDB,
+			DatabasesTotal:  dbsTotal,
+			DatabasesDone:   dbsDone,
+			FailedDatabases: failedDBs,
+			BackupPaths:     paths,
+			SizeBytes:       totalSize,
+			DurationSeconds: int64(time.Since(startTime).Seconds()),
+		}
+		if err != nil {
+			progress.ErrorMessage = err.Error()
+		}
+		select {
+		case progressCh <- progress:
+		default:
+			e.logger.Warn("progress channel full, dropping update")
+		}
+	}
+
+	// Phase 1: Connect and enumerate databases
+	sendProgress("running", 5, "enumerating", "", 0, 0, nil, nil, 0, nil)
+
+	// Use 'postgres' as connection database if none specified
+	connDB := cfg.Database
+	if connDB == "" {
+		connDB = "postgres"
+	}
+
+	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.Username, cfg.Password, connDB, cfg.SSLMode)
+
+	databases, err := e.listDatabases(ctx, connStr)
+	if err != nil {
+		sendProgress("failed", 5, "enumerating", "", 0, 0, nil, nil, 0, fmt.Errorf("failed to list databases: %w", err))
+		return
+	}
+
+	if len(databases) == 0 {
+		sendProgress("completed", 100, "completed", "", 0, 0, nil, nil, 0, nil)
+		e.logger.Info("no databases found to backup", "job_id", cfg.JobID)
+		return
+	}
+
+	e.logger.Info("found databases to backup",
+		"job_id", cfg.JobID,
+		"count", len(databases),
+		"databases", databases,
+	)
+
+	// Phase 2: Create backup directory
+	var backupDir string
+	if cfg.StorageType == "s3" {
+		backupDir = "/tmp/rampart-backups"
+	} else {
+		backupDir = cfg.StoragePath
+		if backupDir == "" {
+			backupDir = "/var/lib/rampart/backups"
+		}
+	}
+
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		sendProgress("failed", 10, "dumping", "", len(databases), 0, nil, nil, 0, fmt.Errorf("failed to create backup directory: %w", err))
+		return
+	}
+
+	// Phase 3: Backup each database
+	var backupPaths []string
+	var failedDatabases []string
+	var totalSize int64
+	timestamp := time.Now().Format("20060102-150405")
+
+	for i, dbName := range databases {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			sendProgress("failed", 50, "cancelled", dbName, len(databases), i, failedDatabases, backupPaths, totalSize, ctx.Err())
+			return
+		default:
+		}
+
+		// Calculate progress: each database gets equal share of 10-85% range
+		basePercent := 10
+		rangePercent := 75 // 85 - 10
+		dbPercent := basePercent + (i * rangePercent / len(databases))
+
+		sendProgress("running", dbPercent, "dumping", dbName, len(databases), i, failedDatabases, backupPaths, totalSize, nil)
+
+		backupFile := filepath.Join(backupDir, fmt.Sprintf("%s_%s.sql.gz", dbName, timestamp))
+
+		// Run pg_dump for this database
+		size, err := e.backupSingleDatabase(ctx, cfg, dbName, backupFile)
+		if err != nil {
+			e.logger.Error("failed to backup database",
+				"job_id", cfg.JobID,
+				"database", dbName,
+				"error", err,
+			)
+			failedDatabases = append(failedDatabases, dbName)
+			// Continue with next database
+			continue
+		}
+
+		// Upload to S3 if configured
+		finalPath := backupFile
+		if cfg.StorageType == "s3" && cfg.S3AccessKey != "" {
+			s3Path, err := e.uploadToS3(ctx, cfg, backupFile)
+			if err != nil {
+				e.logger.Error("failed to upload database backup to S3",
+					"job_id", cfg.JobID,
+					"database", dbName,
+					"error", err,
+				)
+				failedDatabases = append(failedDatabases, dbName)
+				continue
+			}
+			finalPath = s3Path
+			// Remove local file after S3 upload
+			os.Remove(backupFile)
+		}
+
+		backupPaths = append(backupPaths, finalPath)
+		totalSize += size
+
+		e.logger.Info("backed up database",
+			"job_id", cfg.JobID,
+			"database", dbName,
+			"path", finalPath,
+			"size", size,
+		)
+	}
+
+	// Phase 4: Complete
+	finalStatus := "completed"
+	if len(failedDatabases) > 0 {
+		if len(failedDatabases) == len(databases) {
+			finalStatus = "failed"
+		} else {
+			finalStatus = "partial"
+		}
+	}
+
+	duration := time.Since(startTime)
+	finalProgress := BackupProgress{
+		JobID:           cfg.JobID,
+		DatasourceID:    cfg.DatasourceID,
+		Status:          finalStatus,
+		ProgressPercent: 100,
+		CurrentPhase:    "completed",
+		DatabasesTotal:  len(databases),
+		DatabasesDone:   len(databases) - len(failedDatabases),
+		FailedDatabases: failedDatabases,
+		BackupPaths:     backupPaths,
+		SizeBytes:       totalSize,
+		DurationSeconds: int64(duration.Seconds()),
+	}
+	if len(backupPaths) > 0 {
+		finalProgress.BackupPath = strings.Join(backupPaths, ", ")
+	}
+	if len(failedDatabases) > 0 {
+		finalProgress.ErrorMessage = fmt.Sprintf("Failed to backup %d database(s): %s", len(failedDatabases), strings.Join(failedDatabases, ", "))
+	}
+	progressCh <- finalProgress
+
+	e.logger.Info("multi-database backup completed",
+		"job_id", cfg.JobID,
+		"status", finalStatus,
+		"databases_total", len(databases),
+		"databases_done", len(databases)-len(failedDatabases),
+		"failed_databases", failedDatabases,
+		"total_size", totalSize,
+		"duration", duration,
+	)
+}
+
+// backupSingleDatabase runs pg_dump for a single database and returns the backup size.
+func (e *PGExecutor) backupSingleDatabase(ctx context.Context, cfg BackupConfig, dbName, backupFile string) (int64, error) {
+	// Set PGPASSWORD environment variable
+	env := append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", cfg.Password))
+
+	// Build pg_dump command
+	args := []string{
+		"-h", cfg.Host,
+		"-p", strconv.Itoa(cfg.Port),
+		"-U", cfg.Username,
+		"-d", dbName,
+		"-F", "p", // plain text format (for compression)
+	}
+
+	cmd := exec.CommandContext(ctx, "pg_dump", args...)
+	cmd.Env = env
+
+	// Create output file with gzip compression
+	outFile, err := os.Create(backupFile)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create backup file: %w", err)
+	}
+	defer outFile.Close()
+
+	gzWriter := gzip.NewWriter(outFile)
+	defer gzWriter.Close()
+
+	// Capture stdout for the dump
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return 0, fmt.Errorf("failed to start pg_dump: %w", err)
+	}
+
+	// Copy stdout to gzip file
+	stdoutDone := make(chan struct{})
+	go func() {
+		defer close(stdoutDone)
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := stdout.Read(buf)
+			if n > 0 {
+				gzWriter.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// Wait for command to complete
+	err = cmd.Wait()
+	<-stdoutDone // Wait for stdout goroutine
+
+	if err != nil {
+		os.Remove(backupFile)
+		return 0, fmt.Errorf("pg_dump failed: %w", err)
+	}
+
+	// Close gzip writer to flush
+	gzWriter.Close()
+	outFile.Close()
+
+	// Get file size
+	fileInfo, err := os.Stat(backupFile)
+	if err != nil {
+		return 0, nil // File exists but can't stat, return 0 size
+	}
+
+	return fileInfo.Size(), nil
 }

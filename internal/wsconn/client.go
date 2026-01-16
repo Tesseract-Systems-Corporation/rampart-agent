@@ -2,6 +2,7 @@
 package wsconn
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -60,6 +61,9 @@ type Config struct {
 // CommandHandler is called when a command is received from the control plane.
 type CommandHandler func(cmd Command)
 
+// PluginManifestProvider provides plugin manifests for syncing with the control plane.
+type PluginManifestProvider func() []map[string]any
+
 // Command represents a command from the control plane.
 type Command struct {
 	ID      string          `json:"id"`
@@ -82,8 +86,9 @@ type Client struct {
 	conn   *websocket.Conn
 	connMu sync.Mutex
 
-	commandHandler CommandHandler
-	isConnected    atomic.Bool
+	commandHandler         CommandHandler
+	pluginManifestProvider PluginManifestProvider
+	isConnected            atomic.Bool
 
 	send chan []byte
 }
@@ -152,6 +157,12 @@ func (c *Client) SetCommandHandler(handler CommandHandler) {
 	c.commandHandler = handler
 }
 
+// SetPluginProvider sets the provider for plugin manifests.
+// When set, the client will sync plugin manifests to the control plane on connect.
+func (c *Client) SetPluginProvider(provider PluginManifestProvider) {
+	c.pluginManifestProvider = provider
+}
+
 // IsConnected returns whether the WebSocket is currently connected.
 func (c *Client) IsConnected() bool {
 	return c.isConnected.Load()
@@ -207,6 +218,9 @@ func (c *Client) Run(ctx context.Context) error {
 			c.closeConn()
 			continue
 		}
+
+		// Sync plugins to control plane (non-blocking, errors are logged but don't prevent connection)
+		go c.syncPlugins(ctx)
 
 		// Run read/write loops
 		if err := c.runLoop(ctx); err != nil {
@@ -280,6 +294,73 @@ func (c *Client) sendIdentify() error {
 	}
 
 	return c.sendMessage(&msg)
+}
+
+// syncPlugins syncs plugin manifests to the control plane via HTTP.
+func (c *Client) syncPlugins(ctx context.Context) {
+	if c.pluginManifestProvider == nil {
+		return
+	}
+
+	manifests := c.pluginManifestProvider()
+	if len(manifests) == 0 {
+		return
+	}
+
+	c.logger.Info("syncing plugins to control plane", "count", len(manifests))
+
+	// Build request body
+	reqBody := map[string]any{
+		"agent_version": c.agentVersion,
+		"plugins":       manifests,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		c.logger.Warn("failed to marshal plugin sync request", "error", err)
+		return
+	}
+
+	// Build URL
+	syncURL := c.endpoint + "/agent/plugins/sync"
+
+	// Create request with timeout
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, "POST", syncURL, bytes.NewReader(body))
+	if err != nil {
+		c.logger.Warn("failed to create plugin sync request", "error", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	// Send request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.logger.Warn("failed to sync plugins", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Warn("plugin sync failed", "status", resp.StatusCode)
+		return
+	}
+
+	// Parse response
+	var result struct {
+		Synced int `json:"synced"`
+		Total  int `json:"total"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+		c.logger.Info("plugins synced successfully",
+			"synced", result.Synced,
+			"total", result.Total,
+		)
+	}
 }
 
 // sendMessage sends a message over the WebSocket.
